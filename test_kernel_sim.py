@@ -209,16 +209,20 @@ class TestFileDescriptorTable(unittest.TestCase):
         desc = OpenFileDescription(inode=inode, flags=O_RDONLY)
         fd3 = self.fdt.allocate_fd(desc)
         self.assertEqual(fd3, 3)
-        self.assertEqual(desc.ref_count, 2)  # initial 1 + allocated 1
+        self.assertEqual(desc.ref_count, 1)  # 1 active reference
 
         fd4 = self.fdt.allocate_fd(desc)
         self.assertEqual(fd4, 4)
+        self.assertEqual(desc.ref_count, 2)  # 2 active references
 
         # Close fd 3 and reallocate -> lowest available fd is 3
         err = self.fdt.close(fd3)
         self.assertEqual(err, PosixErrno.SUCCESS)
+        self.assertEqual(desc.ref_count, 1)  # 1 active reference remaining
+
         fd_new = self.fdt.allocate_fd(desc)
         self.assertEqual(fd_new, 3)
+        self.assertEqual(desc.ref_count, 2)
 
     def test_close_invalid_fd(self):
         self.assertEqual(self.fdt.close(999), PosixErrno.EBADF)
@@ -491,6 +495,139 @@ class TestAssemblyEmulatorREPL(unittest.TestCase):
         # target_addr is now unmapped and must trigger SIGSEGV
         with self.assertRaises(SegmentationFault):
             vmm.read_bytes(target_addr, 10)
+
+    def test_fork_child_register_and_privilege_state(self):
+        """Verify child process context after sys_fork (Ring 3, user RSP, next RIP, RAX=0)."""
+        proc = self.repl.kernel.proc_mgr.current
+        proc.write_reg("RAX", 57)  # sys_fork
+        user_rsp_before = proc.read_reg("RSP")
+        user_rip_before = proc.read_reg("RIP")
+
+        with redirect_stdout(io.StringIO()):
+            child_pid = self.repl.kernel.trigger_trap("SYSCALL")
+
+        self.assertGreater(child_pid, proc.pid)
+        child = self.repl.kernel.proc_mgr.processes[child_pid]
+
+        # Verify child state
+        self.assertEqual(child.cpl, PrivilegeLevel.RING_3)
+        self.assertEqual(child.read_reg("RAX"), 0)
+        self.assertEqual(child.read_reg("RSP"), user_rsp_before)
+        self.assertEqual(child.read_reg("RIP"), user_rip_before + 2)
+        # Parent RAX is child PID
+        self.assertEqual(proc.read_reg("RAX"), child_pid)
+
+    def test_sys_read_stdin_buffered(self):
+        """Verify sys_read reads data from STDIN (fd 0)."""
+        proc = self.repl.kernel.proc_mgr.current
+        stdin_stream = proc.fd_table.get(0)
+        stdin_stream.feed_input(b"Hello Stdin\n")
+
+        proc.vmm.sys_brk(USER_HEAP_START + 4096)
+        buf_addr = proc.vmm.start_brk
+
+        proc.write_reg("RAX", 0)  # sys_read
+        proc.write_reg("RDI", 0)  # STDIN
+        proc.write_reg("RSI", buf_addr)
+        proc.write_reg("RDX", 12)
+
+        with redirect_stdout(io.StringIO()):
+            bytes_read = self.repl.kernel.trigger_trap("SYSCALL")
+
+        self.assertEqual(bytes_read, 12)
+        self.assertEqual(proc.vmm.read_bytes(buf_addr, 12), b"Hello Stdin\n")
+
+    def test_count_zero_on_invalid_fd_returns_ebadf(self):
+        """Verify read and write with count=0 on invalid fd return -EBADF."""
+        proc = self.repl.kernel.proc_mgr.current
+        proc.write_reg("RAX", 0)  # sys_read
+        proc.write_reg("RDI", 999)  # bad fd
+        proc.write_reg("RSI", USER_DATA_BASE)
+        proc.write_reg("RDX", 0)
+        with redirect_stdout(io.StringIO()):
+            ret_read = self.repl.kernel.trigger_trap("SYSCALL")
+        self.assertEqual(ret_read, errno_to_u64(PosixErrno.EBADF))
+
+        proc.write_reg("RAX", 1)  # sys_write
+        proc.write_reg("RDI", 999)  # bad fd
+        proc.write_reg("RSI", USER_DATA_BASE)
+        proc.write_reg("RDX", 0)
+        with redirect_stdout(io.StringIO()):
+            ret_write = self.repl.kernel.trigger_trap("SYSCALL")
+        self.assertEqual(ret_write, errno_to_u64(PosixErrno.EBADF))
+
+    def test_open_file_posix_edge_cases(self):
+        """Test open_file empty path, EISDIR on directory write, and ENOTDIR on trailing slash."""
+        # 1. Empty string -> ENOENT
+        desc, err = self.repl.kernel.vfs.open_file("", flags=O_RDONLY)
+        self.assertEqual(err, PosixErrno.ENOENT)
+        self.assertIsNone(desc)
+
+        desc, err = self.repl.kernel.vfs.open_file("", flags=O_CREAT | O_WRONLY)
+        self.assertEqual(err, PosixErrno.ENOENT)
+        self.assertIsNone(desc)
+
+        # 2. Open directory for write -> EISDIR
+        desc, err = self.repl.kernel.vfs.open_file("/home", flags=O_WRONLY)
+        self.assertEqual(err, PosixErrno.EISDIR)
+
+        # 3. Trailing slash on regular file -> ENOTDIR
+        desc, err = self.repl.kernel.vfs.open_file("/etc/os-release/", flags=O_RDONLY)
+        self.assertEqual(err, PosixErrno.ENOTDIR)
+
+    def test_repl_inline_comments(self):
+        """Verify REPL strips inline comments (; and #) properly."""
+        with redirect_stdout(io.StringIO()):
+            self.repl.execute_command_line("MOV RAX, 123 ; inline comment here")
+            self.assertEqual(self.repl.kernel.proc_mgr.current.read_reg("RAX"), 123)
+
+            self.repl.execute_command_line("MOV RDI, 456 # hash comment here")
+            self.assertEqual(self.repl.kernel.proc_mgr.current.read_reg("RDI"), 456)
+
+            # Quoted comments should be preserved in literals
+            self.repl.execute_command_line("MOV RSI, \"String; with # symbols\" ; trailing comment")
+            rsi_addr = self.repl.kernel.proc_mgr.current.read_reg("RSI")
+            stored = self.repl.kernel.proc_mgr.current.vmm.read_string(rsi_addr)
+            self.assertEqual(stored, "String; with # symbols")
+
+    def test_repl_memory_mov_dereference(self):
+        """Verify MOV [addr], val and MOV reg, [addr] work via REPL."""
+        addr = USER_DATA_BASE + 256
+        with redirect_stdout(io.StringIO()):
+            self.repl.execute_command_line(f"MOV [{hex(addr)}], 0xCAFEBABE")
+            self.repl.execute_command_line(f"MOV R9, [{hex(addr)}]")
+        self.assertEqual(self.repl.kernel.proc_mgr.current.read_reg("R9"), 0xCAFEBABE)
+
+    def test_consecutive_demos_reset_process_state(self):
+        """Verify consecutive demos run cleanly even if prior demo called sys_exit."""
+        with redirect_stdout(io.StringIO()):
+            # hello_world exits with sys_exit(0)
+            self.repl.cmd_load("hello_world")
+            self.repl.cmd_run()
+            self.assertEqual(self.repl.kernel.proc_mgr.current.state, ProcessState.TERMINATED)
+
+            # file_io should revitalize process context and succeed
+            self.repl.cmd_load("file_io")
+            self.assertEqual(self.repl.kernel.proc_mgr.current.state, ProcessState.RUNNING)
+            self.assertIsNotNone(self.repl.kernel.proc_mgr.current.fd_table.get(1))
+            self.repl.cmd_run()
+            self.assertEqual(self.repl.pc, len(self.repl.loaded_program))
+
+            # heap_alloc should also revitalize and succeed
+            self.repl.cmd_load("heap_alloc")
+            self.assertEqual(self.repl.kernel.proc_mgr.current.state, ProcessState.RUNNING)
+            self.repl.cmd_run()
+            self.assertEqual(self.repl.pc, len(self.repl.loaded_program))
+
+    def test_text_segment_write_protection(self):
+        """Verify writing to code segment [USER_TEXT_BASE, USER_DATA_BASE) raises SegmentationFault."""
+        vmm = VirtualMemoryManager(pid=3000)
+        # Read from text base is allowed
+        self.assertTrue(vmm.is_address_valid(USER_TEXT_BASE, 8, is_write=False))
+        # Write to text base triggers fault
+        self.assertFalse(vmm.is_address_valid(USER_TEXT_BASE, 8, is_write=True))
+        with self.assertRaises(SegmentationFault):
+            vmm.write_bytes(USER_TEXT_BASE, b"ILLEGAL")
 
 
 if __name__ == "__main__":

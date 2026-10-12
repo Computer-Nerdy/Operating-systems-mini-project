@@ -109,11 +109,12 @@ python kernel_sim.py
 ```
 
 ### Supported Commands:
-* `MOV <REG>, <VAL>`: Assign register with an integer, hex (`0x...`), another register, or a quoted string literal `MOV RSI, "Hello\n"` (automatically stored in user data memory).
-* `SYSCALL` / `INT 0x80`: Trigger the hardware trap into Ring 0 kernel space.
+* `MOV <REG>, <VAL>`: Assign register with an integer, hex (`0x...`), another register, memory load `MOV RAX, [0x402000]`, memory store `MOV [0x402000], RAX`, or a quoted string literal `MOV RSI, "Hello\n"` (automatically stored in user data memory).
+* `SYSCALL` / `INT 0x80`: Trigger the hardware trap into Ring 0 kernel space (`SYSCALL` uses MSR_LSTAR and returns via `SYSRETQ`; `INT 0x80` uses IDT vector 0x80 and returns via `IRETQ`).
 * `DUMP`: Show live 64-bit registers in Hex and Decimal, CPL privilege ring, memory boundaries, and open file descriptors.
 * `LS_DISK`: Display inode table, permissions, sizes, and file paths on the virtual hard disk.
 * `CAT <filepath>`: Inspect contents of a file on the virtual disk.
+* `INPUT <text>`: Feed buffered input directly into STDIN (fd 0).
 * `LOAD <demo_name>`: Load a pre-configured assembly program:
   * `hello_world`: Syscall write to STDOUT and exit.
   * `file_io`: Full lifecycle test: create, write, close, open, read into heap, echo to STDOUT.

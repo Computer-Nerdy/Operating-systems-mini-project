@@ -137,6 +137,8 @@ class PosixErrno(enum.IntEnum):
     EACCES  = 13   # Permission denied
     EFAULT  = 14   # Bad address (Segmentation fault)
     EEXIST  = 17   # File exists
+    ENOTDIR = 20   # Not a directory
+    EISDIR  = 21   # Is a directory
     EINVAL  = 22   # Invalid argument
     ENFILE  = 23   # Too many open files in system
     EMFILE  = 24   # Too many open files for process
@@ -256,10 +258,15 @@ class VirtualMemoryManager:
         """
         Validates if [addr, addr + size) falls strictly within mapped user memory.
         Mapped areas:
-        - Text/Data segment: [USER_TEXT_BASE, USER_TEXT_BASE + 0x100000)
+        - Text segment (R-X): [USER_TEXT_BASE, USER_DATA_BASE) - read-only
+        - Static Data (RW-):  [USER_DATA_BASE, USER_TEXT_BASE + 0x100000)
         - Allocated Heap:    [USER_HEAP_START, current_brk)
-        - Stack segment:     [stack_ptr, USER_STACK_TOP)
+        - Stack segment:     [USER_STACK_INIT - 0x10000, USER_STACK_TOP)
         """
+        if size < 0 or addr < 0:
+            return False
+        if size == 0:
+            return True
         if addr < USER_TEXT_BASE or (addr + size) > USER_SPACE_CEIL:
             return False
 
@@ -268,6 +275,9 @@ class VirtualMemoryManager:
         end = addr + size
         while curr < end:
             # Segment 1: Text / Static Data
+            # Text section is strictly read-only; attempts to write trigger SIGSEGV
+            if is_write and (USER_TEXT_BASE <= curr < USER_DATA_BASE):
+                return False
             in_text_data = (USER_TEXT_BASE <= curr < USER_TEXT_BASE + 0x100000)
             # Segment 2: Allocated Heap
             in_heap = (self.start_brk <= curr < self.current_brk)
@@ -285,9 +295,9 @@ class VirtualMemoryManager:
         """Raises SegmentationFault if the range is invalid."""
         if size == 0:
             return
-        if not self.is_address_valid(addr, size, is_write):
+        if size < 0 or not self.is_address_valid(addr, size, is_write):
             raise SegmentationFault(
-                f"SIGSEGV: Invalid memory reference at virtual address 0x{addr:016x} (size={size})",
+                f"SIGSEGV: Invalid memory reference at virtual address 0x{addr:016x} (size={size}, is_write={is_write})",
                 fault_addr=addr
             )
 
@@ -436,7 +446,7 @@ class OpenFileDescription:
     inode: Inode
     flags: int
     offset: int = 0
-    ref_count: int = 1
+    ref_count: int = 0
 
 
 class VirtualFileSystem:
@@ -559,16 +569,22 @@ class VirtualFileSystem:
 
     def open_file(self, path: str, flags: int, mode: int = 0o644, cwd: str = "/") -> Tuple[Optional[OpenFileDescription], PosixErrno]:
         """Opens or creates a file according to POSIX flags."""
+        if not path or not path.strip():
+            return None, PosixErrno.ENOENT
+
+        has_trailing_slash = path.endswith("/") or path.endswith("\\")
         target = self.resolve_path(path, cwd=cwd)
 
         # Check creation flag
         if target is None:
-            if not (flags & O_CREAT):
+            if not (flags & O_CREAT) or has_trailing_slash:
                 return None, PosixErrno.ENOENT
 
             # Resolve parent directory
             norm = os.path.normpath(os.path.join(cwd, path) if not path.startswith("/") else path).replace("\\", "/")
             parent_dir, basename = os.path.split(norm)
+            if not basename:
+                return None, PosixErrno.ENOENT
             parent_inode = self.resolve_path(parent_dir)
             if not parent_inode or parent_inode.itype != InodeType.DIRECTORY:
                 return None, PosixErrno.ENOENT
@@ -581,16 +597,20 @@ class VirtualFileSystem:
             parent_inode.entries[basename] = target.ino
         else:
             # File exists
+            if has_trailing_slash and target.itype != InodeType.DIRECTORY:
+                return None, PosixErrno.ENOTDIR
+
             if (flags & O_CREAT) and (flags & O_EXCL):
                 return None, PosixErrno.EEXIST
 
-            if target.itype == InodeType.DIRECTORY and ((flags & O_WRONLY) or (flags & O_RDWR)):
-                return None, PosixErrno.EACCES
+            access_mode = flags & 3
+            is_write_req = (access_mode == O_WRONLY or access_mode == O_RDWR)
+            is_read_req = (access_mode == O_RDONLY or access_mode == O_RDWR)
+
+            if target.itype == InodeType.DIRECTORY and is_write_req:
+                return None, PosixErrno.EISDIR
 
             # Check permissions
-            is_write_req = bool((flags & O_WRONLY) or (flags & O_RDWR))
-            is_read_req = not (flags & O_WRONLY)
-
             if is_read_req and not (target.permissions & 0o400):
                 return None, PosixErrno.EACCES
             if is_write_req and not (target.permissions & 0o200):
@@ -625,6 +645,17 @@ class ConsoleStream:
     def read(self, count: int) -> bytes:
         if not self.readable:
             return b""
+        if self.name == "STDIN" and len(self.read_buffer) == 0:
+            try:
+                if sys.stdin and not sys.stdin.closed:
+                    if sys.stdin.isatty():
+                        sys.stdout.write(colorize("[STDIN] Input: ", Colors.BRIGHT_MAGENTA, Colors.BOLD))
+                        sys.stdout.flush()
+                    line = sys.stdin.readline()
+                    if line:
+                        self.feed_input(line.encode("utf-8"))
+            except Exception:
+                pass
         actual = min(count, len(self.read_buffer))
         chunk = bytes(self.read_buffer[:actual])
         del self.read_buffer[:actual]
@@ -794,7 +825,13 @@ class ProcessManager:
 
         # Duplicate register states
         child.regs = dict(parent.regs)
-        child.cpl = parent.cpl
+        # In child context: privilege is User (Ring 3), RSP is user stack, RIP is next instruction, RAX is 0
+        child.cpl = PrivilegeLevel.RING_3
+        user_rsp = parent.saved_pt_regs.rsp if parent.saved_pt_regs else parent.regs["RSP"]
+        user_rip = parent.saved_pt_regs.rip if parent.saved_pt_regs else parent.regs["RIP"]
+        child.regs["RSP"] = user_rsp
+        child.regs["RIP"] = user_rip + 2
+        child.regs["RAX"] = 0
         child.cwd = parent.cwd
         child.priority = parent.priority
         child.state = ProcessState.READY
@@ -807,12 +844,12 @@ class ProcessManager:
         return child, PosixErrno.SUCCESS
 
     def terminate(self, proc: PCB, exit_code: int):
-        """Terminates process, closing open handles."""
+        """Terminates process, closing dynamic handles while preserving standard streams."""
         proc.state = ProcessState.TERMINATED
         proc.exit_code = exit_code
 
-        # Close all open file descriptors
-        open_fds = list(proc.fd_table.table.keys())
+        # Close all dynamic file descriptors (fd >= 3)
+        open_fds = [fd for fd in list(proc.fd_table.table.keys()) if fd >= 3]
         for fd in open_fds:
             proc.fd_table.close(fd)
 
@@ -915,13 +952,14 @@ class Kernel:
         if signed_count < 0:
             return errno_to_u64(PosixErrno.EINVAL)
         count = signed_count
-        if count == 0:
-            return 0
 
-        # Validate file descriptor
+        # Validate file descriptor FIRST before checking count == 0
         handle = proc.fd_table.get(fd)
         if handle is None:
             return errno_to_u64(PosixErrno.EBADF)
+
+        if count == 0:
+            return 0
 
         # Validate user-space destination buffer
         try:
@@ -935,11 +973,14 @@ class Kernel:
                 return errno_to_u64(PosixErrno.EBADF)
             read_data = handle.read(count)
         elif isinstance(handle, OpenFileDescription):
-            if handle.flags & O_WRONLY:
+            access_mode = handle.flags & 3
+            if access_mode == O_WRONLY:
                 return errno_to_u64(PosixErrno.EBADF)
 
             inode = handle.inode
-            if inode.itype == InodeType.CHAR_DEV and inode.read_device:
+            if inode.itype == InodeType.DIRECTORY:
+                return errno_to_u64(PosixErrno.EISDIR)
+            elif inode.itype == InodeType.CHAR_DEV and inode.read_device:
                 read_data = inode.read_device(count)
             elif inode.itype == InodeType.FILE:
                 available = len(inode.data) - handle.offset
@@ -969,13 +1010,14 @@ class Kernel:
         if signed_count < 0:
             return errno_to_u64(PosixErrno.EINVAL)
         count = signed_count
-        if count == 0:
-            return 0
 
-        # Validate file descriptor
+        # Validate file descriptor FIRST before checking count == 0
         handle = proc.fd_table.get(fd)
         if handle is None:
             return errno_to_u64(PosixErrno.EBADF)
+
+        if count == 0:
+            return 0
 
         # Validate user-space source buffer
         try:
@@ -995,12 +1037,14 @@ class Kernel:
                 print(colorize(f"[STDERR PID {proc.pid}] ", Colors.BRIGHT_RED) + text, end="", flush=True)
             return len(data)
         elif isinstance(handle, OpenFileDescription):
-            is_writable = bool((handle.flags & O_WRONLY) or (handle.flags & O_RDWR))
-            if not is_writable:
+            access_mode = handle.flags & 3
+            if access_mode == O_RDONLY:
                 return errno_to_u64(PosixErrno.EBADF)
 
             inode = handle.inode
-            if inode.itype == InodeType.CHAR_DEV and inode.write_device:
+            if inode.itype == InodeType.DIRECTORY:
+                return errno_to_u64(PosixErrno.EISDIR)
+            elif inode.itype == InodeType.CHAR_DEV and inode.write_device:
                 return inode.write_device(data)
             elif inode.itype == InodeType.FILE:
                 if handle.flags & O_APPEND:
@@ -1123,6 +1167,11 @@ class Kernel:
         r8  = proc.read_reg("R8")
         r9  = proc.read_reg("R9")
 
+        # Determine trap mechanism and return instruction
+        is_int80 = instruction_name.upper().startswith("INT")
+        trap_source = "Interrupt Descriptor Table (IDT Gate 0x80 / Vector 128)" if is_int80 else "MSR_LSTAR Fast Syscall Entry (Register 0xC0000082)"
+        ret_instruction = "IRETQ (Interrupt Return to Ring 3)" if is_int80 else "SYSRETQ (Fast Return to Ring 3 User Code)"
+
         # ----------------------------------------------------------------------
         # VISUAL LOG: BANNER
         # ----------------------------------------------------------------------
@@ -1137,10 +1186,11 @@ class Kernel:
         # STEP 1: TRAP FIRED
         # ----------------------------------------------------------------------
         self.logger.step(
-            1, "CPU Trap Detected (MSR_LSTAR / Vector 0x80)",
+            1, f"CPU Trap Detected ({'Vector 0x80' if is_int80 else 'MSR_LSTAR'})",
             [
                 f"Active Process: PID {proc.pid} ('{proc.name}') | PPID: {proc.ppid}",
                 f"Instruction: {colorize(instruction_name, Colors.BOLD, Colors.BRIGHT_YELLOW)} at RIP: 0x{user_rip:016x}",
+                f"Trap Entry: {trap_source}",
                 f"Privilege Mode: Ring {proc.cpl.value} ({proc.cpl.name})",
                 f"Syscall Requested: RAX = {syscall_nr} (0x{syscall_nr:04x})"
             ]
@@ -1246,8 +1296,26 @@ class Kernel:
                 )
 
         # ----------------------------------------------------------------------
-        # STEP 6: RETURN VALUE WRITEBACK & SYSRETQ RESTORE
+        # STEP 6: RETURN VALUE WRITEBACK & RESTORATION
         # ----------------------------------------------------------------------
+        if proc.state == ProcessState.TERMINATED:
+            pt_regs.rax = ret_val
+            proc.write_reg("RAX", ret_val)
+            self.logger.step(
+                6, "Process Termination & Kernel Cleanup (Task Exit)",
+                [
+                    f"Process PID {proc.pid} terminated with exit status {proc.exit_code}.",
+                    "Kernel released dynamic file descriptors and scheduled task exit.",
+                    "No user space resumption: CPU task dead (do_task_dead / do_exit)."
+                ],
+                success=True
+            )
+            self.logger.summary(
+                True,
+                f"Process PID {proc.pid} Terminated with Exit Code {proc.exit_code}. Context freed."
+            )
+            return ret_val
+
         pt_regs.rax = ret_val
         proc.write_reg("RAX", ret_val)
 
@@ -1259,10 +1327,10 @@ class Kernel:
         proc.regs["RIP"] = user_rip + 2
 
         self.logger.step(
-            6, "Context Restoration & SYSRETQ (Ring 0 ➔ Ring 3)",
+            6, f"Context Restoration & {ret_instruction.split()[0]} (Ring 0 ➔ Ring 3)",
             [
                 f"Writing syscall result {format_u64(ret_val)} into RAX.",
-                "Executing SYSRETQ instruction:",
+                f"Executing {ret_instruction}:",
                 f"  Privilege Level: {colorize('Ring 0', Colors.BRIGHT_RED)} ➔ {colorize('Ring 3 (USER)', Colors.BRIGHT_GREEN, Colors.BOLD)}",
                 f"  Restoring User Stack Pointer: RSP ➔ 0x{user_rsp:016x}",
                 f"  Restoring RFLAGS ➔ 0x{user_rflags:016x}",
@@ -1368,28 +1436,33 @@ class DemoPrograms:
             AsmInstruction("MOV", ["RDI", hex(file_addr)], f"MOV RDI, {hex(file_addr)}", f'path = "{filename}"'),
             AsmInstruction("MOV", ["RSI", "0"], "MOV RSI, 0", "flags = O_RDONLY (0)"),
             AsmInstruction("SYSCALL", [], "SYSCALL", "Trap: Open file for reading (FD returned in RAX)"),
-
-            # 5. sys_read from file
             AsmInstruction("MOV", ["R8", "RAX"], "MOV R8, RAX", "Save read FD in R8"),
+
+            # 5. Expand heap via sys_brk to provide valid buffer space
+            AsmInstruction("MOV", ["RAX", "12"], "MOV RAX, 12", "Syscall #12 = sys_brk"),
+            AsmInstruction("MOV", ["RDI", hex(heap_buf + 4096)], f"MOV RDI, {hex(heap_buf + 4096)}", "Allocate 4KB heap for read buffer"),
+            AsmInstruction("SYSCALL", [], "SYSCALL", "Trap: Map heap memory for read buffer"),
+
+            # 6. sys_read from file into heap memory
             AsmInstruction("MOV", ["RAX", "0"], "MOV RAX, 0", "Syscall #0 = sys_read"),
             AsmInstruction("MOV", ["RDI", "R8"], "MOV RDI, R8", "FD to read"),
             AsmInstruction("MOV", ["RSI", hex(heap_buf)], f"MOV RSI, {hex(heap_buf)}", "Dest buffer in heap"),
             AsmInstruction("MOV", ["RDX", "128"], "MOV RDX, 128", "Max count = 128 bytes"),
             AsmInstruction("SYSCALL", [], "SYSCALL", "Trap: Read file data into heap memory"),
 
-            # 6. sys_write to STDOUT
+            # 7. sys_write to STDOUT
             AsmInstruction("MOV", ["RDX", "RAX"], "MOV RDX, RAX", "Count = bytes read from previous syscall"),
             AsmInstruction("MOV", ["RAX", "1"], "MOV RAX, 1", "Syscall #1 = sys_write"),
             AsmInstruction("MOV", ["RDI", "1"], "MOV RDI, 1", "fd 1 = STDOUT"),
             AsmInstruction("MOV", ["RSI", hex(heap_buf)], f"MOV RSI, {hex(heap_buf)}", "Echo buffer"),
             AsmInstruction("SYSCALL", [], "SYSCALL", "Trap: Echo read data to terminal STDOUT"),
 
-            # 7. sys_close file
+            # 8. sys_close file
             AsmInstruction("MOV", ["RAX", "3"], "MOV RAX, 3", "Syscall #3 = sys_close"),
             AsmInstruction("MOV", ["RDI", "R8"], "MOV RDI, R8", "Close read FD"),
             AsmInstruction("SYSCALL", [], "SYSCALL", "Trap: Close file"),
 
-            # 8. sys_exit
+            # 9. sys_exit
             AsmInstruction("MOV", ["RAX", "60"], "MOV RAX, 60", "Syscall #60 = sys_exit"),
             AsmInstruction("MOV", ["RDI", "0"], "MOV RDI, 0", "Status = 0"),
             AsmInstruction("SYSCALL", [], "SYSCALL", "Trap: Terminate")
@@ -1420,7 +1493,7 @@ class DemoPrograms:
         1. Query initial program break via sys_brk(0)
         2. Attempt to write to unallocated heap address (triggers SIGSEGV / EFAULT)
         3. Extend heap break by 4096 bytes via sys_brk(initial + 4096)
-        4. Write to the newly allocated address (succeeds)
+        4. Write to the newly allocated address in the heap (succeeds)
         5. Output heap data to STDOUT
         """
         proc = kernel.proc_mgr.current
@@ -1429,7 +1502,6 @@ class DemoPrograms:
         safe_addr = start_brk + 64
 
         test_msg = "Heap Allocation Verified: Dynamic memory accessed safely!\n"
-        msg_addr = proc.vmm.allocate_static_string(test_msg)
         msg_len = len(test_msg.encode("utf-8"))
 
         return [
@@ -1450,14 +1522,17 @@ class DemoPrograms:
             AsmInstruction("MOV", ["RDI", hex(new_brk)], f"MOV RDI, {hex(new_brk)}", f"Expand break to {hex(new_brk)} (+4KB)"),
             AsmInstruction("SYSCALL", [], "SYSCALL", "Trap: Kernel maps new pages and returns new brk"),
 
-            # 4. Now safe to write message to STDOUT
+            # 4. Store message directly into newly allocated heap memory
+            AsmInstruction("STORE", [hex(safe_addr), f'"{test_msg}"'], f'STORE {hex(safe_addr)} "{test_msg.strip()}"', "Write into newly allocated heap"),
+
+            # 5. Now safe to write message from heap memory to STDOUT
             AsmInstruction("MOV", ["RAX", "1"], "MOV RAX, 1", "Syscall #1 = sys_write"),
             AsmInstruction("MOV", ["RDI", "1"], "MOV RDI, 1", "fd 1 = STDOUT"),
-            AsmInstruction("MOV", ["RSI", hex(msg_addr)], f"MOV RSI, {hex(msg_addr)}", "Heap allocation success message"),
+            AsmInstruction("MOV", ["RSI", hex(safe_addr)], f"MOV RSI, {hex(safe_addr)}", "Heap buffer address"),
             AsmInstruction("MOV", ["RDX", str(msg_len)], f"MOV RDX, {msg_len}", f"Count = {msg_len} bytes"),
-            AsmInstruction("SYSCALL", [], "SYSCALL", "Trap: Print success message to STDOUT"),
+            AsmInstruction("SYSCALL", [], "SYSCALL", "Trap: Print heap data to STDOUT"),
 
-            # 5. Exit
+            # 6. Exit
             AsmInstruction("MOV", ["RAX", "60"], "MOV RAX, 60", "Syscall #60 = sys_exit"),
             AsmInstruction("MOV", ["RDI", "0"], "MOV RDI, 0", "Status = 0"),
             AsmInstruction("SYSCALL", [], "SYSCALL", "Trap: Terminate")
@@ -1642,8 +1717,27 @@ class AssemblyEmulatorREPL:
         except ValueError:
             print(colorize(f"Error: Invalid value expression '{val_str}'", Colors.BRIGHT_RED))
 
+    def _reset_shell_proc(self):
+        """Ensures active process is in ready/running state with valid standard streams."""
+        proc = self.kernel.proc_mgr.current
+        proc.state = ProcessState.RUNNING
+        proc.exit_code = None
+        proc.cpl = PrivilegeLevel.RING_3
+        proc.regs = {reg: 0 for reg in REGISTER_NAMES}
+        proc.regs["RSP"] = USER_STACK_INIT
+        proc.regs["RIP"] = USER_TEXT_BASE
+        proc.regs["RFLAGS"] = RFLAGS_DEFAULT
+        # Ensure standard streams (fd 0, 1, 2) are present
+        if 0 not in proc.fd_table.table:
+            proc.fd_table.table[0] = ConsoleStream("STDIN", readable=True, writable=False)
+        if 1 not in proc.fd_table.table:
+            proc.fd_table.table[1] = ConsoleStream("STDOUT", readable=False, writable=True)
+        if 2 not in proc.fd_table.table:
+            proc.fd_table.table[2] = ConsoleStream("STDERR", readable=False, writable=True)
+
     def cmd_load(self, demo_name: str):
         """Loads a pre-defined demo assembly program into the emulator."""
+        self._reset_shell_proc()
         name = demo_name.lower().strip()
         if name == "hello_world":
             self.loaded_program = DemoPrograms.hello_world(self.kernel)
@@ -1695,6 +1789,8 @@ class AssemblyEmulatorREPL:
 
         if inst.opcode == "MOV":
             self.cmd_mov(inst.args[0], inst.args[1])
+        elif inst.opcode == "STORE":
+            self.cmd_store(inst.args[0], inst.args[1])
         elif inst.opcode in ("SYSCALL", "INT"):
             trap_name = f"{inst.opcode} {' '.join(inst.args)}".strip()
             self.kernel.trigger_trap(trap_name)
@@ -1830,7 +1926,23 @@ class AssemblyEmulatorREPL:
     def execute_command_line(self, line: str) -> bool:
         """Parses and executes a single REPL command. Returns False to exit."""
         line = line.strip()
-        if not line or line.startswith("#") or line.startswith(";"):
+        if not line:
+            return True
+
+        # Strip comments while preserving string literals
+        clean_chars = []
+        in_sq = False
+        in_dq = False
+        for ch in line:
+            if ch == "'" and not in_dq:
+                in_sq = not in_sq
+            elif ch == '"' and not in_sq:
+                in_dq = not in_dq
+            elif (ch == ';' or ch == '#') and not in_sq and not in_dq:
+                break
+            clean_chars.append(ch)
+        line = "".join(clean_chars).strip()
+        if not line:
             return True
 
         # Custom split to preserve quotes
@@ -1877,11 +1989,51 @@ class AssemblyEmulatorREPL:
             else:
                 print(colorize("Usage: MOV <REG>, <VALUE>", Colors.BRIGHT_RED))
                 return True
+
+            # Check for memory store: MOV [addr], val
+            if reg_name.startswith("[") and reg_name.endswith("]"):
+                addr_expr = reg_name[1:-1].strip()
+                self.cmd_store(addr_expr, val_str)
+                return True
+
+            # Check for memory load: MOV reg, [addr]
+            if val_str.startswith("[") and val_str.endswith("]"):
+                addr_expr = val_str[1:-1].strip()
+                proc = self.kernel.proc_mgr.current
+                reg_upper = reg_name.upper()
+                if reg_upper not in REGISTER_NAMES:
+                    print(colorize(f"Error: Unknown register '{reg_name}'.", Colors.BRIGHT_RED))
+                    return True
+                try:
+                    target_addr = proc.read_reg(addr_expr.upper()) if addr_expr.upper() in REGISTER_NAMES else (int(addr_expr, 16) if addr_expr.startswith("0x") else int(addr_expr))
+                    val_bytes = proc.vmm.read_bytes(target_addr, 8)
+                    loaded_val = struct.unpack("<Q", val_bytes)[0]
+                    proc.write_reg(reg_upper, loaded_val)
+                    print(colorize(f"{reg_upper} ➔ {format_u64(loaded_val)} (loaded from [0x{target_addr:016x}])", Colors.BRIGHT_GREEN))
+                except Exception as ex:
+                    print(colorize(f"Error loading from memory: {ex}", Colors.BRIGHT_RED))
+                return True
+
             self.cmd_mov(reg_name, val_str)
 
         elif cmd in ("SYSCALL", "INT"):
             trap_name = " ".join(tokens) if cmd == "INT" else cmd
             self.kernel.trigger_trap(trap_name)
+
+        elif cmd == "INPUT":
+            if len(tokens) < 2:
+                print(colorize("Usage: INPUT <text_to_feed_into_stdin>", Colors.BRIGHT_RED))
+            else:
+                raw_text = line[len(tokens[0]):].strip()
+                if (raw_text.startswith('"') and raw_text.endswith('"')) or (raw_text.startswith("'") and raw_text.endswith("'")):
+                    raw_text = raw_text[1:-1].encode("utf-8").decode("unicode_escape")
+                stdin_stream = self.kernel.proc_mgr.current.fd_table.get(0)
+                if isinstance(stdin_stream, ConsoleStream):
+                    data = (raw_text + "\n").encode("utf-8")
+                    stdin_stream.feed_input(data)
+                    print(colorize(f"✔ Fed {len(data)} bytes into STDIN buffer.", Colors.BRIGHT_GREEN))
+                else:
+                    print(colorize("Error: fd 0 is not a console input stream.", Colors.BRIGHT_RED))
 
         elif cmd == "LOAD":
             if len(tokens) < 2:
@@ -2049,6 +2201,30 @@ def run_all_tests() -> bool:
     assert_true(child_pid > parent.pid, f"sys_fork spawned child PID {child_pid}")
     child_pcb = k_fork.proc_mgr.processes[child_pid]
     assert_true(child_pcb.read_reg("RAX") == 0, "sys_fork returned 0 in child context")
+    assert_true(child_pcb.cpl == PrivilegeLevel.RING_3, "sys_fork child privilege is Ring 3 (User Space)")
+    assert_true(child_pcb.read_reg("RSP") == USER_STACK_INIT, "sys_fork child restored user stack pointer")
+    assert_true(child_pcb.read_reg("RIP") == parent.read_reg("RIP"), "sys_fork child advanced to next RIP instruction")
+
+    # Test 8b: STDIN read via ConsoleStream feed_input
+    proc.fd_table.table[0].feed_input(b"Input test\n")
+    proc.write_reg("RAX", 0)  # sys_read
+    proc.write_reg("RDI", 0)  # STDIN
+    proc.write_reg("RSI", proc.vmm.start_brk)
+    proc.write_reg("RDX", 11)
+    k.trigger_trap("SYSCALL")
+    assert_true(proc.vmm.read_bytes(proc.vmm.start_brk, 11) == b"Input test\n", "sys_read successfully read from STDIN")
+
+    # Test 8c: read with count 0 on invalid fd returns -EBADF
+    proc.write_reg("RAX", 0)
+    proc.write_reg("RDI", 999)
+    proc.write_reg("RSI", proc.vmm.start_brk)
+    proc.write_reg("RDX", 0)
+    ebadf_ret = k.trigger_trap("SYSCALL")
+    assert_true(ebadf_ret == errno_to_u64(PosixErrno.EBADF), "sys_read on bad fd with count=0 returns -EBADF")
+
+    # Test 8d: open_file with empty string returns ENOENT
+    _, empty_err = k.vfs.open_file("", flags=O_RDONLY)
+    assert_true(empty_err == PosixErrno.ENOENT, "open_file with empty path returns ENOENT")
 
     # Fork bomb guard threshold
     for _ in range(ProcessManager.MAX_PROCESSES + 2):
@@ -2074,6 +2250,10 @@ def run_all_tests() -> bool:
     repl.cmd_run()
     created_file = k.vfs.resolve_path("/home/user/sim_demo.txt")
     assert_true(created_file is not None and len(created_file.data) > 0, "file_io demo successfully wrote and persisted file")
+
+    repl.cmd_load("heap_alloc")
+    repl.cmd_run()
+    assert_true(repl.pc == len(repl.loaded_program), "RUN heap_alloc executed all instructions")
 
     print(colorize("\n" + "=" * 80, Colors.BRIGHT_BLUE))
     print(colorize(f"TEST RESULTS: {test_passed} PASSED, {test_failed} FAILED", Colors.BRIGHT_GREEN if test_failed == 0 else Colors.BRIGHT_RED, Colors.BOLD))
