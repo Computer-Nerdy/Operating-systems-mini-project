@@ -1236,7 +1236,41 @@ def build_docx_report(file_path):
         r = p.add_run(ref)
         r.font.name = "Times New Roman"
         r.font.size = Pt(10)
-        
+
+    # -------------------------------------------------------------
+    # APPENDIX: SOURCE CODE
+    # -------------------------------------------------------------
+    doc.add_page_break()
+    h1 = doc.add_paragraph()
+    r = h1.add_run("APPENDIX\nSOURCE CODE")
+    r.font.name = "Arial"
+    r.font.size = Pt(15)
+    r.font.bold = True
+    r.font.color.rgb = navy
+
+    h2 = doc.add_paragraph()
+    h2.paragraph_format.space_before = Pt(6)
+    h2.paragraph_format.space_after = Pt(12)
+    r = h2.add_run("Complete Source Code: kernel_sim.py")
+    r.font.name = "Arial"
+    r.font.size = Pt(11)
+    r.font.bold = True
+    r.font.color.rgb = slate_blue
+
+    kernel_sim_path = os.path.join(os.path.dirname(__file__), "kernel_sim.py")
+    if os.path.exists(kernel_sim_path):
+        with open(kernel_sim_path, "r", encoding="utf-8") as f_src:
+            src_lines = f_src.readlines()
+        for line in src_lines:
+            p_code = doc.add_paragraph()
+            p_code.paragraph_format.space_before = Pt(0)
+            p_code.paragraph_format.space_after = Pt(0)
+            p_code.paragraph_format.line_spacing = 1.0
+            r_code = p_code.add_run(line.rstrip("\r\n"))
+            r_code.font.name = "Consolas"
+            r_code.font.size = Pt(7.0)
+            r_code.font.color.rgb = RGBColor(0x22, 0x22, 0x22)
+
     doc.save(file_path)
     print(f"Successfully generated DOCX report at: {file_path}")
 
